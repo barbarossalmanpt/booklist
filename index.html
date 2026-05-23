@@ -1001,14 +1001,15 @@
 
       const filterMap = {
         title: "title",
-        author: "author_name",
+        author: "author",
         subject: "subject"
       };
       const field = filterMap[searchFilter] || "title";
+      const query = `${field}:${q}`;
 
       try {
         const params = new URLSearchParams({
-          [field]: q,
+          q: query,
           fields: "key,title,author_name,first_publish_year,cover_i,number_of_pages_median,publisher,language",
           limit: 40
         });
