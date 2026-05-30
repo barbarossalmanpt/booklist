@@ -936,12 +936,15 @@
 
     /* ====== Global State ====== */
     let uid = null;
+    let previousUid = null;
     let readingMap = {};
     let listFilter = "all";
     let searchFilter = "title";
     let activePanel = "search";
     let activeModal = null;
     let searchDebounceTimer = null;
+    let libraryUnsubscribe = null;
+    let isInitialized = false;
 
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
@@ -957,7 +960,15 @@
       try {
         const result = await signInWithPopup(auth, googleProvider);
         const user = result.user;
+        previousUid = uid;
         uid = user.uid;
+        
+        // Clear old data when switching accounts
+        if (previousUid !== uid) {
+          readingMap = {};
+          document.getElementById("library-content").innerHTML = "";
+        }
+        
         updateAuthUI(user);
         subscribeLibrary();
         toast(`Welcome, ${user.displayName || "User"}!`);
@@ -965,8 +976,10 @@
         console.error("Google sign-in error:", error);
         if (error.code === "auth/popup-blocked") {
           toast("Pop-up blocked. Please allow pop-ups for this site.");
-        } else if (error.code !== "auth/cancelled-popup-request") {
-          toast("Sign-in failed. Try again.");
+        } else if (error.code === "auth/cancelled-popup-request") {
+          // User cancelled, don't show error
+        } else {
+          toast("Sign-in failed. Check your internet and try again.");
         }
       }
     }
@@ -976,14 +989,22 @@
      */
     async function handleSignOut() {
       try {
+        // Unsubscribe from Firestore listener
+        if (libraryUnsubscribe) {
+          libraryUnsubscribe();
+          libraryUnsubscribe = null;
+        }
+
         await signOut(auth);
+        previousUid = uid;
         uid = null;
         readingMap = {};
+        isInitialized = false;
         updateAuthUI(null);
         toast("Signed out");
       } catch (error) {
         console.error("Sign-out error:", error);
-        toast("Sign-out failed");
+        toast("Sign-out failed. Try again.");
       }
     }
 
@@ -1067,6 +1088,31 @@
     function getCoverUrl(coverId, size = "M") {
       if (!coverId) return null;
       return `https://covers.openlibrary.org/b/id/${coverId}-${size}.jpg`;
+    }
+
+    /**
+     * Save books to local storage for offline access
+     */
+    function cacheLibraryLocal() {
+      try {
+        localStorage.setItem(`folio_cache_${uid}`, JSON.stringify(readingMap));
+      } catch (error) {
+        console.warn("Local storage cache failed:", error);
+      }
+    }
+
+    /**
+     * Load books from local storage for offline access
+     */
+    function loadCachedLibrary() {
+      try {
+        if (!uid) return null;
+        const cached = localStorage.getItem(`folio_cache_${uid}`);
+        return cached ? JSON.parse(cached) : null;
+      } catch (error) {
+        console.warn("Local storage load failed:", error);
+        return null;
+      }
     }
 
     /* ====== Search Functionality ====== */
@@ -1155,8 +1201,9 @@
      * Save book to Firestore
      */
     async function saveBook(book) {
-      if (!uid) {
-        toast("Not connected. Please refresh the page.");
+      if (!uid || !isInitialized) {
+        toast("Not connected. Refreshing...");
+        location.reload();
         return;
       }
 
@@ -1178,10 +1225,21 @@
           rating: 0,
           addedAt: Date.now()
         });
-        toast("Added to library");
+        toast("✓ Added to library");
       } catch (error) {
         console.error("Save error:", error);
-        toast("Failed to save. Check your connection.");
+        
+        if (error.code === "permission-denied") {
+          toast("Permission denied. Try signing in again.");
+        } else if (error.code === "unauthenticated") {
+          toast("Session expired. Please sign in again.");
+          uid = null;
+          updateAuthUI(null);
+        } else if (error.code === "unavailable") {
+          toast("No internet connection. Try again later.");
+        } else {
+          toast("Failed to save. Try again.");
+        }
       }
     }
 
@@ -1189,13 +1247,20 @@
      * Remove book from Firestore
      */
     async function removeBook(bookKey) {
-      if (!uid) return;
+      if (!uid) {
+        toast("Not connected. Try again.");
+        return;
+      }
       try {
         await deleteDoc(doc(db, "users", uid, "books", bookKey));
-        toast("Removed from library");
+        toast("✓ Removed from library");
       } catch (error) {
         console.error("Remove error:", error);
-        toast("Failed to remove");
+        if (error.code === "permission-denied") {
+          toast("Permission denied. Try signing in again.");
+        } else {
+          toast("Failed to remove. Try again.");
+        }
       }
     }
 
@@ -1203,11 +1268,19 @@
      * Update book fields (status, rating, etc.)
      */
     async function patchBook(bookKey, data) {
-      if (!uid) return;
+      if (!uid) {
+        toast("Not connected. Try again.");
+        return;
+      }
       try {
         await updateDoc(doc(db, "users", uid, "books", bookKey), data);
       } catch (error) {
         console.error("Update error:", error);
+        if (error.code === "permission-denied") {
+          toast("Permission denied. Try signing in again.");
+        } else {
+          toast("Failed to update. Try again.");
+        }
       }
     }
 
@@ -1364,6 +1437,7 @@
       if (book.olKey) {
         try {
           const res = await fetch(`https://openlibrary.org${book.olKey}.json`);
+          if (!res.ok) throw new Error("Failed to fetch");
           const workData = await res.json();
           const desc = workData.description 
             ? (typeof workData.description === "string" ? workData.description : workData.description.value)
@@ -1374,33 +1448,49 @@
             descEl.textContent = desc;
           }
         } catch (error) {
+          console.error("Description fetch error:", error);
           const descEl = document.getElementById("modal-desc");
           if (descEl) {
-            descEl.textContent = "No description available";
+            descEl.textContent = "Description not available";
           }
         }
       } else {
         document.getElementById("modal-desc").textContent = "No description available";
       }
 
-      // CTA button
+      // CTA button with dynamic state updates
       const ctaBtn = document.getElementById("modal-cta");
-      const isSaved = readingMap[bookKey];
       
-      if (!uid) {
-        ctaBtn.disabled = true;
-        ctaBtn.textContent = "Initializing...";
-        ctaBtn.onclick = () => {
-          toast("Still connecting. Please wait...");
-        };
-      } else {
-        ctaBtn.disabled = isSaved;
-        ctaBtn.textContent = isSaved ? "Already Saved" : "Add to Library";
-        ctaBtn.onclick = () => {
-          if (!isSaved) saveBook(book);
+      const updateButtonState = () => {
+        const isSaved = readingMap[bookKey];
+        
+        if (!isInitialized || !uid) {
+          ctaBtn.disabled = true;
+          ctaBtn.textContent = "Connecting...";
+          ctaBtn.style.opacity = "0.6";
+        } else if (isSaved) {
+          ctaBtn.disabled = true;
+          ctaBtn.textContent = "Already Saved";
+          ctaBtn.style.opacity = "0.6";
+        } else {
+          ctaBtn.disabled = false;
+          ctaBtn.textContent = "Add to Library";
+          ctaBtn.style.opacity = "1";
+        }
+      };
+
+      // Update button state initially
+      updateButtonState();
+
+      // Update button when readingMap changes (real-time updates)
+      ctaBtn.onclick = () => {
+        if (isInitialized && uid && !readingMap[bookKey]) {
+          saveBook(book);
           closeModal();
-        };
-      }
+        } else if (!isInitialized || !uid) {
+          toast("Still connecting. Please wait...");
+        }
+      };
 
       // Show modal
       document.getElementById("modal-overlay").classList.add("open");
@@ -1452,23 +1542,96 @@
      * Subscribe to library changes via Firestore snapshot
      */
     function subscribeLibrary() {
-      if (!uid) return;
+      if (!uid) {
+        console.warn("subscribeLibrary called but uid not set");
+        return;
+      }
 
-      onSnapshot(collection(db, "users", uid, "books"), (snapshot) => {
-        readingMap = {};
-        snapshot.forEach((doc) => {
-          readingMap[doc.id] = doc.data();
-        });
+      // Unsubscribe from previous listener if it exists
+      if (libraryUnsubscribe) {
+        libraryUnsubscribe();
+        libraryUnsubscribe = null;
+      }
 
-        // Update UI
+      // Clear reading map for new account
+      readingMap = {};
+
+      // Try to load from cache first
+      const cachedLibrary = loadCachedLibrary();
+      if (cachedLibrary && Object.keys(cachedLibrary).length > 0) {
+        readingMap = cachedLibrary;
         if (activePanel === "library") {
           renderLibrary();
-        } else {
-          // Re-render search results to update badges
-          const query = document.getElementById("search-input").value;
-          if (query) search(query);
         }
-      });
+      }
+
+      // Subscribe with error handling
+      try {
+        libraryUnsubscribe = onSnapshot(
+          collection(db, "users", uid, "books"),
+          (snapshot) => {
+            readingMap = {};
+            snapshot.forEach((doc) => {
+              readingMap[doc.id] = doc.data();
+            });
+
+            // Cache to local storage
+            cacheLibraryLocal();
+
+            // Update UI
+            if (activePanel === "library") {
+              renderLibrary();
+            } else {
+              // Re-render search results to update badges
+              const query = document.getElementById("search-input").value;
+              if (query) search(query);
+            }
+          },
+          (error) => {
+            console.error("Firestore listener error:", error);
+            
+            // Handle specific errors
+            if (error.code === "permission-denied") {
+              toast("❌ Access denied. Check your login.");
+            } else if (error.code === "unauthenticated") {
+              toast("❌ Session expired. Please sign in again.");
+              uid = null;
+              updateAuthUI(null);
+            } else if (error.code === "unavailable") {
+              toast("⚠️ Offline. Using cached data.");
+              // Load from cache on offline
+              const cached = loadCachedLibrary();
+              if (cached) {
+                readingMap = cached;
+                if (activePanel === "library") {
+                  renderLibrary();
+                }
+              }
+            } else {
+              toast("⚠️ Connection issue. Using cached data.");
+              // Load from cache on error
+              const cached = loadCachedLibrary();
+              if (cached) {
+                readingMap = cached;
+                if (activePanel === "library") {
+                  renderLibrary();
+                }
+              }
+            }
+          }
+        );
+      } catch (error) {
+        console.error("Firestore subscription error:", error);
+        toast("⚠️ Failed to sync. Using cached data.");
+        // Try to load from cache
+        const cached = loadCachedLibrary();
+        if (cached) {
+          readingMap = cached;
+          if (activePanel === "library") {
+            renderLibrary();
+          }
+        }
+      }
     }
 
     /* ====== Event Listeners ====== */
@@ -1545,12 +1708,21 @@
       const loadingBanner = document.getElementById("loading-banner");
       loadingBanner.style.display = "block";
 
-      // Wait for Firebase auth
+      // Wait for Firebase auth with timeout
       return new Promise((resolve) => {
+        const authTimeout = setTimeout(() => {
+          console.error("Auth timeout");
+          loadingBanner.innerHTML = '<span>⚠️ Connection timeout. <a href="javascript:location.reload()" style="color: white; text-decoration: underline;">Refresh page</a></span>';
+          resolve(false);
+        }, 15000); // 15 second timeout
+
         const unsubscribe = onAuthStateChanged(auth, async (user) => {
+          clearTimeout(authTimeout);
+
           if (user) {
             // User is signed in (either Google or previously anonymous)
             uid = user.uid;
+            isInitialized = true;
             updateAuthUI(user);
             subscribeLibrary();
             loadingBanner.style.display = "none";
@@ -1561,20 +1733,27 @@
             try {
               const result = await signInAnonymously(auth);
               uid = result.user.uid;
+              isInitialized = true;
               subscribeLibrary();
               loadingBanner.style.display = "none";
               resolve(true);
             } catch (error) {
               console.error("Anonymous auth error:", error);
               loadingBanner.innerHTML = '<span>⚠️ Connection failed. Retrying...</span>';
+              
               // Retry after a short delay
               setTimeout(() => {
                 try {
                   signInAnonymously(auth).then((result) => {
                     uid = result.user.uid;
+                    isInitialized = true;
                     subscribeLibrary();
                     loadingBanner.style.display = "none";
                     resolve(true);
+                  }).catch((retryError) => {
+                    console.error("Auth retry failed:", retryError);
+                    loadingBanner.innerHTML = '<span>❌ Unable to connect. <a href="javascript:location.reload()" style="color: white; text-decoration: underline;">Refresh page</a></span>';
+                    resolve(false);
                   });
                 } catch (retryError) {
                   console.error("Auth retry failed:", retryError);
